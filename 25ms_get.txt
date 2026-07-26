@@ -1,0 +1,1262 @@
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Camera = game:GetService("Workspace").CurrentCamera
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Configurações Globais
+if not _G.HospitalConfig then
+    _G.HospitalConfig = {
+        InstantAction = false,
+        AutoProcess = false,
+        AutoHeal = false,
+        AutoRoom6 = false,
+        AutoRoom7 = false,
+        AutoRoom8 = false,
+        NoClip = false,
+        WalkSpeed = 16
+    }
+end
+local Config = _G.HospitalConfig
+local PromptConnections = {}
+local OriginalCollisions = {}
+
+-- Estruturas de controle ultra velozes
+local ItemDebounce = {}
+local ITEM_PICKUP_COOLDOWN = 0.2
+
+-- ==========================================
+-- CACHE PARA ITENS (OTIMIZAÇÃO)
+-- ==========================================
+
+local ItemPromptCache = {}
+local CacheRefreshTime = 0
+local CACHE_DURATION = 3
+
+local function RefreshItemCache()
+    ItemPromptCache = {}
+    CacheRefreshTime = os.clock()
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc.Enabled and desc.ActionText then
+            ItemPromptCache[string.lower(desc.ActionText)] = desc
+        end
+    end
+end
+
+local function GetCachedItemPrompt(itemName)
+    if not itemName or itemName == "" then return nil end
+    if os.clock() - CacheRefreshTime > CACHE_DURATION then RefreshItemCache() end
+    local target = string.lower(itemName)
+    for key, prompt in pairs(ItemPromptCache) do
+        if string.find(key, target) or string.find(target, key) then return prompt end
+    end
+    return nil
+end
+
+-- ==========================================
+-- FUNÇÕES UTILITÁRIAS GLOBAIS
+-- ==========================================
+
+local function GetCharacter()
+    return LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+end
+
+local function GetHumanoid()
+    local char = GetCharacter()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function GetRootPart()
+    local char = GetCharacter()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function FindBasePartInObject(obj)
+    if not obj then return nil end
+    if obj:IsA("BasePart") then return obj end
+    for _, child in ipairs(obj:GetChildren()) do
+        if child:IsA("BasePart") then return child end
+        if child:IsA("Model") then
+            local part = FindBasePartInObject(child)
+            if part then return part end
+        end
+    end
+    return nil
+end
+
+local function SafeTeleport(position)
+    local root = GetRootPart()
+    if not root then return end
+    local newPos = position + Vector3.new(0, 2, 0)
+    local success, err = pcall(function()
+        root.CFrame = CFrame.new(newPos)
+    end)
+    if success then
+        RunService.Heartbeat:Wait()
+        root.Velocity = Vector3.new(0, 0, 0)
+        local hum = GetHumanoid()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Running) end
+    end
+end
+
+local function LookAtPosition(targetPosition)
+    local root = GetRootPart()
+    if root and targetPosition then
+        pcall(function()
+            root.CFrame = CFrame.lookAt(root.Position, targetPosition)
+            
+            local character = GetCharacter()
+            if character then
+                local head = character:FindFirstChild("Head")
+                if head then
+                    local camPos = head.Position - (root.CFrame.LookVector * 4) + Vector3.new(0, 2, 0)
+                    Camera.CFrame = CFrame.lookAt(camPos, targetPosition)
+                end
+            end
+        end)
+    end
+end
+
+local function FirePromptDirect(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then return false end
+    
+    local targetPart = FindBasePartInObject(prompt.Parent)
+    if targetPart then
+        LookAtPosition(targetPart.Position)
+    end
+    
+    if Config.InstantAction then prompt.HoldDuration = 0 end
+    
+    local success = false
+    
+    local s1, e1 = pcall(function()
+        fireproximityprompt(prompt)
+    end)
+    if s1 then success = true end
+    
+    if not success then
+        local s2, e2 = pcall(function()
+            prompt:InputHoldStart(LocalPlayer)
+            task.wait(0.05)
+            prompt:InputHoldEnd(LocalPlayer)
+        end)
+        if s2 then success = true end
+    end
+    
+    if not success then
+        local s3, e3 = pcall(function()
+            local mouse = LocalPlayer:GetMouse()
+            if mouse then
+                local part = FindBasePartInObject(prompt.Parent)
+                if part then
+                    mouse.Target = part
+                    mouse.TargetClick:Fire()
+                end
+            end
+        end)
+        if s3 then success = true end
+    end
+    
+    return success
+end
+
+local function FirePromptWithCamera(prompt, targetPosition)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return false end
+    if targetPosition then
+        LookAtPosition(targetPosition)
+    end
+    return FirePromptDirect(prompt)
+end
+
+local function ClickButton(buttonPart)
+    if not buttonPart then return false end
+    local clickDetector = buttonPart:FindFirstChildOfClass("ClickDetector")
+    if clickDetector then
+        LookAtPosition(buttonPart.Position)
+        local success, err = pcall(function() fireclickdetector(clickDetector) end)
+        if success then return true end
+    end
+    return false
+end
+
+local function HasItem(itemName)
+    if not itemName or itemName == "" then return false end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and string.find(string.lower(tool.Name), string.lower(itemName)) then
+                return true
+            end
+        end
+    end
+    local char = GetCharacter()
+    if char then
+        for _, tool in ipairs(char:GetChildren()) do
+            if tool:IsA("Tool") and string.find(string.lower(tool.Name), string.lower(itemName)) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function EquipToolFast(itemName)
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local hum = GetHumanoid()
+    if backpack and hum then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and string.find(string.lower(tool.Name), string.lower(itemName)) then
+                hum:EquipTool(tool)
+                task.wait(0.05)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- ==========================================
+-- FUNÇÕES DE LOCALIZAÇÃO DO MAPA
+-- ==========================================
+
+local function GetMedicalRooms()
+    local rooms = Workspace:FindFirstChild("Rooms")
+    if rooms then return rooms:FindFirstChild("Medical") end
+    return Workspace:FindFirstChild("Medical")
+end
+
+local function GetEmergencyRooms()
+    local rooms = Workspace:FindFirstChild("Rooms")
+    if rooms then return rooms:FindFirstChild("Emergency") end
+    return Workspace:FindFirstChild("Emergency")
+end
+
+local function FindInBedInRoom(room)
+    if not room then return nil end
+    local minigame = room:FindFirstChild("Minigame")
+    if minigame then
+        local bed = minigame:FindFirstChild("Bed")
+        if bed then return bed:FindFirstChild("InBed") end
+    end
+    return room:FindFirstChild("InBed")
+end
+
+local function FindInvInRoom(room)
+    if not room then return nil end
+    local minigame = room:FindFirstChild("Minigame")
+    if minigame then
+        local tv = minigame:FindFirstChild("TV")
+        if tv then
+            local screen = tv:FindFirstChild("Screen")
+            if screen then
+                local ui = screen:FindFirstChild("UI")
+                if ui then
+                    local report = ui:FindFirstChild("Report")
+                    if report then return report:FindFirstChild("inv") end
+                end
+            end
+        end
+    end
+    return room:FindFirstChild("inv", true)
+end
+
+local function FindColorsInMinigame(room)
+    if not room then return nil end
+    local minigame = room:FindFirstChild("Minigame")
+    if not minigame then return nil end
+    for _, desc in ipairs(minigame:GetDescendants()) do
+        if desc.Name == "Colors" and desc:IsA("Folder") then return desc end
+    end
+    return nil
+end
+
+local function FindXrayMonitorInMinigame(room)
+    if not room then return nil end
+    local minigame = room:FindFirstChild("Minigame")
+    if not minigame then return nil end
+    for _, desc in ipairs(minigame:GetDescendants()) do
+        if desc.Name == "xrayMonitor" and desc:IsA("Model") then return desc end
+    end
+    return nil
+end
+
+local function HasCheck(item)
+    if not item then return false end
+    local check = item:FindFirstChild("check")
+    if check and check:IsA("ImageLabel") then return check.Visible == true end
+    return false
+end
+
+local function GetItemsFromInv(invFolder)
+    local itemsNeeded = {}
+    if not invFolder then return itemsNeeded end
+    for _, child in ipairs(invFolder:GetChildren()) do
+        if not child:IsA("UIGridLayout") and not child:IsA("UIListLayout") then
+            if child.Name and child.Name ~= "" and not HasCheck(child) then
+                table.insert(itemsNeeded, child.Name)
+            end
+        end
+    end
+    return itemsNeeded
+end
+
+-- ==========================================
+-- FUNÇÕES ESPECÍFICAS PARA ROOM 6
+-- ==========================================
+
+local function GetButtonModels(colorsFolder)
+    if not colorsFolder then return {} end
+    local buttons = {}
+    for _, model in ipairs(colorsFolder:GetChildren()) do
+        if model:IsA("Model") and model:FindFirstChild("Button") then
+            local btn = model:FindFirstChild("Button")
+            if btn and btn:IsA("BasePart") then
+                table.insert(buttons, btn)
+            end
+        end
+    end
+    return buttons
+end
+
+local function GetButtonColors(colorsFolder)
+    if not colorsFolder then return {} end
+    local colors = {}
+    for _, model in ipairs(colorsFolder:GetChildren()) do
+        if model:IsA("Model") and model:FindFirstChild("Button") then
+            local btn = model:FindFirstChild("Button")
+            if btn and btn:IsA("BasePart") then
+                table.insert(colors, btn.Color)
+            end
+        end
+    end
+    return colors
+end
+
+local function CountChangedButtons(colorsFolder, initialColors)
+    if not colorsFolder or not initialColors then return 0 end
+    local currentColors = GetButtonColors(colorsFolder)
+    local changed = 0
+    for i = 1, math.min(#initialColors, #currentColors) do
+        if initialColors[i] ~= currentColors[i] then
+            changed = changed + 1
+        end
+    end
+    return changed
+end
+
+local function GetPromptByActionText(actionText, searchRoot)
+    if not actionText or actionText == "" then return nil end
+    if not searchRoot then searchRoot = Workspace end
+    
+    local targetText = string.lower(actionText)
+    for _, desc in ipairs(searchRoot:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc.Enabled and desc.ActionText then
+            local lowerAction = string.lower(desc.ActionText)
+            if string.find(lowerAction, targetText) or string.find(targetText, lowerAction) then
+                return desc
+            end
+        end
+    end
+    return nil
+end
+
+-- ==========================================
+-- AUTO ROOM 6 CORRIGIDO (SEQUÊNCIA COMPLETA)
+-- ==========================================
+
+local function AutoRoom6Sequence()
+    local emergency = GetEmergencyRooms()
+    if not emergency then return end
+    
+    local room6 = emergency:FindFirstChild("Room6")
+    if not room6 then return end
+    
+    local minigame = room6:FindFirstChild("Minigame")
+    if not minigame then return end
+    
+    print("🔄 Iniciando Auto Room 6...")
+    
+    -- ==========================================
+    -- PASSO 1: Begin X-Ray
+    -- ==========================================
+    local xrayMonitor = FindXrayMonitorInMinigame(room6)
+    if xrayMonitor then
+        local xrayPrompt = xrayMonitor:FindFirstChild("PP")
+        if xrayPrompt and xrayPrompt:IsA("ProximityPrompt") and xrayPrompt.Enabled then
+            local part = FindBasePartInObject(xrayMonitor)
+            if part then
+                print("📸 Interagindo com Begin X-Ray...")
+                SafeTeleport(part.Position)
+                FirePromptWithCamera(xrayPrompt, part.Position)
+                wait(0.5)
+            end
+        end
+    end
+    
+    -- ==========================================
+    -- PASSO 2: Aguardar 4 botões mudarem de cor
+    -- ==========================================
+    local colorsFolder = FindColorsInMinigame(room6)
+    if not colorsFolder then
+        print("❌ Pasta Colors não encontrada!")
+        return
+    end
+    
+    local initialColors = GetButtonColors(colorsFolder)
+    local buttons = GetButtonModels(colorsFolder)
+    
+    if #buttons < 4 then
+        print("❌ Menos de 4 botões encontrados!")
+        return
+    end
+    
+    print("🎨 Aguardando 4 botões mudarem de cor...")
+    local timeout = 0
+    local changedCount = 0
+    local maxWaitTime = 15 -- 15 segundos de timeout
+    
+    while timeout < maxWaitTime and changedCount < 4 do
+        wait(0.2)
+        changedCount = CountChangedButtons(colorsFolder, initialColors)
+        timeout = timeout + 0.2
+    end
+    
+    print("✅ " .. changedCount .. " botões mudaram de cor (esperado: 4)")
+    
+    -- ==========================================
+    -- PASSO 3: Esperar 1.5 segundos
+    -- ==========================================
+    print("⏳ Aguardando 1.5 segundos...")
+    wait(1.5)
+    
+    -- ==========================================
+    -- PASSO 4: Clicar nos 4 botões (um por um com foco)
+    -- ==========================================
+    print("🔘 Clicando nos botões...")
+    local clickedCount = 0
+    for _, btn in ipairs(buttons) do
+        if btn and btn:IsA("BasePart") then
+            SafeTeleport(btn.Position + Vector3.new(0, 1, 2))
+            LookAtPosition(btn.Position)
+            wait(0.2)
+            if ClickButton(btn) then
+                clickedCount = clickedCount + 1
+                print("✅ Botão " .. clickedCount .. " clicado")
+            end
+            wait(0.15)
+        end
+    end
+    print("✅ " .. clickedCount .. " botões clicados")
+    
+    -- ==========================================
+    -- PASSO 5: Aguardar e interagir com "Process Results"
+    -- ==========================================
+    print("⏳ Aguardando 'Process Results'...")
+    local processPrompt = nil
+    local processTimeout = 0
+    
+    while processTimeout < 10 do
+        processPrompt = GetPromptByActionText("process results", minigame)
+        if processPrompt then break end
+        wait(0.3)
+        processTimeout = processTimeout + 0.3
+    end
+    
+    if processPrompt then
+        local part = FindBasePartInObject(processPrompt.Parent)
+        if part then
+            print("📄 Interagindo com Process Results...")
+            SafeTeleport(part.Position)
+            FirePromptWithCamera(processPrompt, part.Position)
+            wait(0.5)
+        end
+    else
+        print("⚠️ 'Process Results' não encontrado!")
+    end
+    
+    -- ==========================================
+    -- PASSO 6: Aguardar e interagir com "Print Badge"
+    -- ==========================================
+    print("⏳ Aguardando 'Print Badge'...")
+    local printBadgePrompt = nil
+    local badgeTimeout = 0
+    
+    while badgeTimeout < 10 do
+        printBadgePrompt = GetPromptByActionText("print badge", minigame)
+        if printBadgePrompt then break end
+        wait(0.3)
+        badgeTimeout = badgeTimeout + 0.3
+    end
+    
+    if printBadgePrompt then
+        local part = FindBasePartInObject(printBadgePrompt.Parent)
+        if part then
+            print("🖨️ Interagindo com Print Badge...")
+            SafeTeleport(part.Position)
+            FirePromptWithCamera(printBadgePrompt, part.Position)
+            wait(0.5)
+        end
+    else
+        print("⚠️ 'Print Badge' não encontrado!")
+    end
+    
+    -- ==========================================
+    -- PASSO 7: Procurar "Collect" no Workspace
+    -- ==========================================
+    print("🔍 Procurando 'Collect' no Workspace...")
+    local collectPrompt = nil
+    local collectTimeout = 0
+    
+    while collectTimeout < 8 do
+        collectPrompt = GetPromptByActionText("collect", Workspace)
+        if collectPrompt then break end
+        wait(0.3)
+        collectTimeout = collectTimeout + 0.3
+    end
+    
+    if collectPrompt then
+        local part = FindBasePartInObject(collectPrompt.Parent)
+        if part then
+            print("📦 Interagindo com Collect...")
+            SafeTeleport(part.Position)
+            FirePromptWithCamera(collectPrompt, part.Position)
+            wait(0.3)
+        end
+    else
+        print("⚠️ 'Collect' não encontrado!")
+    end
+    
+    print("✅ Auto Room 6 concluído com sucesso!")
+end
+
+-- Loop principal do Auto Room 6
+task.spawn(function()
+    while true do
+        RunService.Heartbeat:Wait()
+        if Config.AutoRoom6 then
+            AutoRoom6Sequence()
+            print("⏳ Aguardando 3 segundos antes de reiniciar...")
+            wait(3)
+        end
+    end
+end)
+
+-- ==========================================
+-- AUTO HEAL CORRIGIDO (COM VALIDAÇÃO E RETRY)
+-- ==========================================
+
+local function HealRoomFast(roomNum)
+    local room = nil
+    local itemsNeeded = {}
+    local promptToDeliver = nil
+    local deliverPosition = nil
+
+    if roomNum <= 5 then
+        local medical = GetMedicalRooms()
+        if medical then room = medical:FindFirstChild("Room" .. roomNum) end
+        if not room then return false end
+        
+        local invPath = FindInvInRoom(room)
+        if not invPath then return false end
+        itemsNeeded = GetItemsFromInv(invPath)
+        
+        local bedPath = FindInBedInRoom(room)
+        if bedPath then
+            for _, desc in ipairs(bedPath:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") and desc.Enabled then
+                    promptToDeliver = desc
+                    break
+                end
+            end
+            if not promptToDeliver then
+                for _, desc in ipairs(bedPath.Parent:GetDescendants()) do
+                    if desc:IsA("ProximityPrompt") and desc.Enabled then
+                        promptToDeliver = desc
+                        break
+                    end
+                end
+            end
+            deliverPosition = bedPath.Position
+        end
+    elseif roomNum == 6 then
+        local emergency = GetEmergencyRooms()
+        if emergency then room = emergency:FindFirstChild("Room6") end
+        if not room then return false end
+
+        local invPath = FindInvInRoom(room)
+        if not invPath then return false end
+        itemsNeeded = GetItemsFromInv(invPath)
+
+        local npcsFolder = Workspace:FindFirstChild("NPCs")
+        if npcsFolder then
+            for _, npc in ipairs(npcsFolder:GetChildren()) do
+                local pp = npc:FindFirstChild("PP")
+                if pp and pp:IsA("ProximityPrompt") and pp.Enabled and string.find(string.lower(pp.ActionText or ""), "treatment") then
+                    promptToDeliver = pp
+                    deliverPosition = FindBasePartInObject(npc) and FindBasePartInObject(npc).Position
+                    break
+                end
+            end
+        end
+    end
+
+    if #itemsNeeded == 0 or not promptToDeliver then return false end
+    
+    -- FASE 1: Coleta de itens (com retry e validação)
+    local holdingAllItems = true
+    local maxRetries = 3
+    
+    for _, itemName in ipairs(itemsNeeded) do
+        local retryCount = 0
+        local collected = HasItem(itemName)
+        
+        while not collected and retryCount < maxRetries do
+            if HasItem(itemName) then
+                collected = true
+                break
+            end
+            
+            local prompt = GetCachedItemPrompt(itemName)
+            if prompt and prompt.Enabled then
+                local lastPickup = ItemDebounce[prompt] or 0
+                if os.clock() - lastPickup >= ITEM_PICKUP_COOLDOWN then
+                    local part = FindBasePartInObject(prompt.Parent)
+                    if part then
+                        ItemDebounce[prompt] = os.clock()
+                        SafeTeleport(part.Position)
+                        FirePromptDirect(prompt)
+                        task.wait(0.2)
+                        
+                        if HasItem(itemName) then
+                            collected = true
+                            break
+                        end
+                    end
+                end
+            end
+            
+            retryCount = retryCount + 1
+            task.wait(0.1)
+        end
+        
+        if not collected then
+            holdingAllItems = false
+        end
+    end
+    
+    -- FASE 2: Entrega ao paciente
+    if holdingAllItems and deliverPosition then
+        SafeTeleport(deliverPosition + Vector3.new(0, 1, 0))
+        
+        for _, itemName in ipairs(itemsNeeded) do
+            if HasItem(itemName) then
+                EquipToolFast(itemName)
+                local deliverSuccess = false
+                for i = 1, 3 do
+                    if FirePromptDirect(promptToDeliver) then
+                        deliverSuccess = true
+                        break
+                    end
+                    task.wait(0.1)
+                end
+                task.wait(0.1)
+            end
+        end
+    end
+    
+    return true
+end
+
+task.spawn(function()
+    while true do
+        RunService.Heartbeat:Wait()
+        if Config.AutoHeal then
+            for roomNum = 1, 6 do 
+                if not Config.AutoHeal then break end
+                HealRoomFast(roomNum)
+                task.wait(0.1)
+            end
+        end
+    end
+end)
+
+-- ==========================================
+-- AUTO PROCESS GLOBAL (TODAS AS SALAS)
+-- ==========================================
+
+local function ProcessGlobalRooms()
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if not Config.AutoProcess then break end
+        if desc:IsA("ProximityPrompt") and desc.Enabled and desc.ActionText then
+            local txt = string.lower(desc.ActionText)
+            if string.find(txt, "dna") or string.find(txt, "analyze") or string.find(txt, "process") then
+                local part = FindBasePartInObject(desc.Parent)
+                if part then
+                    SafeTeleport(part.Position)
+                    FirePromptDirect(desc)
+                end
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        RunService.Heartbeat:Wait()
+        if Config.AutoProcess then
+            ProcessGlobalRooms()
+        end
+    end
+end)
+
+-- ==========================================
+-- AUTO ROOM 7
+-- ==========================================
+
+local function AutoRoom7Loop()
+    while true do
+        RunService.Heartbeat:Wait()
+        if Config.AutoRoom7 then
+            local emergency = GetEmergencyRooms()
+            local room7 = emergency and emergency:FindFirstChild("Room7")
+            if room7 then
+                local inBed = FindInBedInRoom(room7)
+                if inBed then
+                    for _, prompt in ipairs(inBed:GetDescendants()) do
+                        if prompt:IsA("ProximityPrompt") and prompt.Enabled then
+                            local text = string.lower(prompt.ActionText or "")
+                            local targets = {"sleep", "prepare", "set up", "turn on", "begin", "collect"}
+                            for _, target in ipairs(targets) do
+                                if string.find(text, target) then
+                                    local part = FindBasePartInObject(prompt.Parent)
+                                    if part then
+                                        SafeTeleport(part.Position)
+                                        FirePromptDirect(prompt)
+                                    end
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ==========================================
+-- AUTO ROOM 8
+-- ==========================================
+
+local function AutoRoom8Loop()
+    while true do
+        RunService.Heartbeat:Wait()
+        if Config.AutoRoom8 then
+            local emergency = GetEmergencyRooms()
+            local room8 = emergency and emergency:FindFirstChild("Room8")
+            if room8 then
+                local inBed = FindInBedInRoom(room8)
+                if inBed then
+                    for _, prompt in ipairs(inBed:GetDescendants()) do
+                        if prompt:IsA("ProximityPrompt") and prompt.Enabled then
+                            local text = string.lower(prompt.ActionText or "")
+                            if string.find(text, "sleep") or string.find(text, "patient") then
+                                local part = FindBasePartInObject(prompt.Parent)
+                                if part then
+                                    SafeTeleport(part.Position)
+                                    FirePromptDirect(prompt)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ==========================================
+-- HOOK PROMPTS & NOCLIP
+-- ==========================================
+
+local function HookPrompt(prompt)
+    if not prompt:IsA("ProximityPrompt") then return end
+    if Config.InstantAction then prompt.HoldDuration = 0 end
+end
+
+Workspace.DescendantAdded:Connect(HookPrompt)
+for _, p in ipairs(Workspace:GetDescendants()) do HookPrompt(p) end
+
+local function SaveOriginalCollisions()
+    local char = GetCharacter()
+    if not char or next(OriginalCollisions) ~= nil then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then OriginalCollisions[part] = part.CanCollide end
+    end
+end
+
+local function RestoreOriginalCollisions()
+    local char = GetCharacter()
+    if not char then return end
+    for part, canCollide in pairs(OriginalCollisions) do
+        if part and part.Parent then part.CanCollide = canCollide end
+    end
+    OriginalCollisions = {}
+end
+
+local function ApplyNoClip()
+    local char = GetCharacter()
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+            part.CanCollide = not Config.NoClip
+        end
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    local hum = GetHumanoid()
+    if hum then hum.WalkSpeed = Config.WalkSpeed end
+    if Config.NoClip then
+        SaveOriginalCollisions()
+        ApplyNoClip()
+    else
+        RestoreOriginalCollisions()
+    end
+end)
+
+task.spawn(AutoRoom7Loop)
+task.spawn(AutoRoom8Loop)
+
+-- ==========================================
+-- INTERFACE GRÁFICA (GUI PRESERVAÇÃO)
+-- ==========================================
+
+local function BuildInterface()
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local oldGui = playerGui:FindFirstChild("AnimalHospitalGUI")
+    if oldGui then oldGui:Destroy() end
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "AnimalHospitalGUI"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.Parent = playerGui
+
+    local Shadow = Instance.new("Frame")
+    Shadow.Name = "Shadow"
+    Shadow.Parent = ScreenGui
+    Shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    Shadow.BackgroundTransparency = 0.8
+    Shadow.Position = UDim2.new(0.5, -248, 0.5, -148)
+    Shadow.Size = UDim2.new(0, 496, 0, 296)
+    Shadow.BorderSizePixel = 0
+    Instance.new("UICorner", Shadow).CornerRadius = UDim.new(0, 12)
+
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainFrame"
+    MainFrame.Parent = ScreenGui
+    MainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Position = UDim2.new(0.5, -250, 0.5, -150)
+    MainFrame.Size = UDim2.new(0, 500, 0, 300)
+    MainFrame.ClipsDescendants = true
+    MainFrame.Active = true
+    Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 12)
+
+    local MainStroke = Instance.new("UIStroke", MainFrame)
+    MainStroke.Color = Color3.fromRGB(180, 20, 20)
+    MainStroke.Thickness = 1.5
+    MainStroke.Transparency = 0.4
+
+    local TopBar = Instance.new("TextButton")
+    TopBar.Text = ""
+    TopBar.AutoButtonColor = false
+    TopBar.Parent = MainFrame
+    TopBar.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    TopBar.BackgroundTransparency = 0.3
+    TopBar.Size = UDim2.new(1, 0, 0, 40)
+    TopBar.BorderSizePixel = 0
+    Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 12)
+
+    local Title = Instance.new("TextLabel", TopBar)
+    Title.BackgroundTransparency = 1
+    Title.Position = UDim2.new(0, 12, 0, 2)
+    Title.Size = UDim2.new(0, 160, 0, 20)
+    Title.Font = Enum.Font.FredokaOne
+    Title.Text = "Animal Hospital"
+    Title.TextColor3 = Color3.fromRGB(200, 30, 30)
+    Title.TextSize = 14
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+
+    local SubTitle = Instance.new("TextLabel", TopBar)
+    SubTitle.BackgroundTransparency = 1
+    SubTitle.Position = UDim2.new(0, 12, 0, 22)
+    SubTitle.Size = UDim2.new(0, 160, 0, 16)
+    SubTitle.Font = Enum.Font.FredokaOne
+    SubTitle.Text = "v2.9.9 | By Adrian"
+    SubTitle.TextColor3 = Color3.fromRGB(200, 200, 200)
+    SubTitle.TextSize = 10
+    SubTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+    local function TopBtn(text, x, color)
+        local btn = Instance.new("TextButton", TopBar)
+        btn.BackgroundColor3 = color or Color3.fromRGB(40, 40, 40)
+        btn.BackgroundTransparency = 0.6
+        btn.Position = UDim2.new(1, x, 0, 5)
+        btn.Size = UDim2.new(0, 28, 0, 30)
+        btn.Font = Enum.Font.FredokaOne
+        btn.Text = text
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 16
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        return btn
+    end
+
+    local MinimizeBtn = TopBtn("−", -68, Color3.fromRGB(40, 40, 40))
+    local CloseBtn = TopBtn("✕", -35, Color3.fromRGB(150, 20, 20))
+
+    local HSep = Instance.new("Frame", MainFrame)
+    HSep.BackgroundColor3 = Color3.fromRGB(180, 20, 20)
+    HSep.BackgroundTransparency = 0.4
+    HSep.Position = UDim2.new(0, 0, 0, 40)
+    HSep.Size = UDim2.new(1, 0, 0, 1)
+
+    local Container = Instance.new("Frame", MainFrame)
+    Container.BackgroundTransparency = 1
+    Container.Position = UDim2.new(0, 0, 0, 41)
+    Container.Size = UDim2.new(1, 0, 1, -41)
+
+    local Sidebar = Instance.new("Frame", Container)
+    Sidebar.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+    Sidebar.BackgroundTransparency = 0.5
+    Sidebar.Size = UDim2.new(0, 100, 1, 0)
+
+    local VSep = Instance.new("Frame", Container)
+    VSep.BackgroundColor3 = Color3.fromRGB(180, 20, 20)
+    VSep.BackgroundTransparency = 0.4
+    VSep.Position = UDim2.new(0, 100, 0, 5)
+    VSep.Size = UDim2.new(0, 1, 1, -10)
+
+    local Content = Instance.new("ScrollingFrame", Container)
+    Content.BackgroundTransparency = 1
+    Content.Position = UDim2.new(0, 110, 0, 5)
+    Content.Size = UDim2.new(1, -120, 1, -10)
+    Content.ScrollBarThickness = 4
+    Content.ScrollBarImageColor3 = Color3.fromRGB(180, 20, 20)
+
+    local function SidebarBtn(text, icon, y)
+        local btn = Instance.new("TextButton", Sidebar)
+        btn.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+        btn.BackgroundTransparency = 0.7
+        btn.Position = UDim2.new(0, 5, 0, y)
+        btn.Size = UDim2.new(1, -10, 0, 30)
+        btn.Font = Enum.Font.FredokaOne
+        btn.Text = icon .. " " .. text
+        btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+        btn.TextSize = 12
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        local stroke = Instance.new("UIStroke", btn)
+        stroke.Color = Color3.fromRGB(180, 20, 20)
+        stroke.Thickness = 1
+        stroke.Transparency = 1
+        btn.MouseButton1Click:Connect(function()
+            for _, child in pairs(Sidebar:GetChildren()) do
+                if child:IsA("TextButton") then
+                    child.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+                    child.BackgroundTransparency = 0.7
+                    child.TextColor3 = Color3.fromRGB(200, 200, 200)
+                    child.UIStroke.Transparency = 1
+                end
+            end
+            btn.BackgroundColor3 = Color3.fromRGB(180, 20, 20)
+            btn.BackgroundTransparency = 0.3
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            stroke.Transparency = 0.3
+            UpdateContent(text)
+        end)
+        return btn
+    end
+
+    local function CreateToggle(text, y, desc, callback)
+        local frame = Instance.new("Frame", Content)
+        frame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+        frame.BackgroundTransparency = 0.5
+        frame.Position = UDim2.new(0, 0, 0, y)
+        frame.Size = UDim2.new(1, 0, 0, 45)
+        Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+        local stroke = Instance.new("UIStroke", frame)
+        stroke.Color = Color3.fromRGB(180, 20, 20)
+        stroke.Thickness = 1
+        stroke.Transparency = 0.5
+        local label = Instance.new("TextLabel", frame)
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.new(0, 10, 0, 4)
+        label.Size = UDim2.new(0, 180, 0, 18)
+        label.Font = Enum.Font.FredokaOne
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.TextSize = 13
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        local descLabel = Instance.new("TextLabel", frame)
+        descLabel.BackgroundTransparency = 1
+        descLabel.Position = UDim2.new(0, 10, 0, 24)
+        descLabel.Size = UDim2.new(0, 200, 0, 16)
+        descLabel.Font = Enum.Font.FredokaOne
+        descLabel.Text = desc
+        descLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+        descLabel.TextSize = 9
+        descLabel.TextXAlignment = Enum.TextXAlignment.Left
+        local toggle = Instance.new("Frame", frame)
+        toggle.BackgroundColor3 = Color3.fromRGB(80, 10, 10)
+        toggle.Position = UDim2.new(1, -42, 0, 10)
+        toggle.Size = UDim2.new(0, 34, 0, 25)
+        Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
+        local indicator = Instance.new("Frame", toggle)
+        indicator.BackgroundColor3 = Color3.fromRGB(180, 20, 20)
+        indicator.Position = UDim2.new(0, 2, 0, 2)
+        indicator.Size = UDim2.new(0, 21, 0, 21)
+        Instance.new("UICorner", indicator).CornerRadius = UDim.new(1, 0)
+        local btn = Instance.new("TextButton", toggle)
+        btn.BackgroundTransparency = 1
+        btn.Size = UDim2.new(1, 0, 1, 0)
+        btn.Text = ""
+        local state = false
+        btn.MouseButton1Click:Connect(function()
+            state = not state
+            local tInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad)
+            if state then
+                TweenService:Create(indicator, tInfo, {Position = UDim2.new(0, 11, 0, 2), BackgroundColor3 = Color3.fromRGB(200, 30, 30)}):Play()
+                TweenService:Create(toggle, tInfo, {BackgroundColor3 = Color3.fromRGB(130, 15, 15)}):Play()
+            else
+                TweenService:Create(indicator, tInfo, {Position = UDim2.new(0, 2, 0, 2), BackgroundColor3 = Color3.fromRGB(180, 20, 20)}):Play()
+                TweenService:Create(toggle, tInfo, {BackgroundColor3 = Color3.fromRGB(80, 10, 10)}):Play()
+            end
+            callback(state)
+        end)
+    end
+
+    local function CreateTextBox(text, y, desc, callback)
+        local frame = Instance.new("Frame", Content)
+        frame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+        frame.BackgroundTransparency = 0.5
+        frame.Position = UDim2.new(0, 0, 0, y)
+        frame.Size = UDim2.new(1, 0, 0, 45)
+        Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+        local label = Instance.new("TextLabel", frame)
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.new(0, 10, 0, 4)
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.Font = Enum.Font.FredokaOne
+        label.TextSize = 13
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        local box = Instance.new("TextBox", frame)
+        box.BackgroundColor3 = Color3.fromRGB(40, 10, 10)
+        box.Position = UDim2.new(1, -85, 0, 8)
+        box.Size = UDim2.new(0, 75, 0, 28)
+        box.Font = Enum.Font.FredokaOne
+        box.PlaceholderText = "Valor"
+        box.Text = ""
+        box.TextColor3 = Color3.fromRGB(255, 255, 255)
+        box.TextSize = 12
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+        box.FocusLost:Connect(function(enter)
+            if enter then callback(box.Text) end
+        end)
+    end
+
+    local function CreateLabel(text, y, color)
+        local label = Instance.new("TextLabel", Content)
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.new(0, 5, 0, y)
+        label.Size = UDim2.new(1, -10, 0, 22)
+        label.Font = Enum.Font.FredokaOne
+        label.Text = text
+        label.TextColor3 = color or Color3.fromRGB(200, 30, 30)
+        label.TextSize = 13
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        return label
+    end
+
+    local function CreateButton(text, y, color, callback)
+        local btn = Instance.new("TextButton", Content)
+        btn.BackgroundColor3 = color or Color3.fromRGB(40, 10, 10)
+        btn.BackgroundTransparency = 0.4
+        btn.Position = UDim2.new(0, 0, 0, y)
+        btn.Size = UDim2.new(1, 0, 0, 32)
+        btn.Font = Enum.Font.FredokaOne
+        btn.Text = text
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 12
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        btn.MouseButton1Click:Connect(callback)
+    end
+
+    local function UpdateCanvas()
+        local maxY = 0
+        for _, child in pairs(Content:GetChildren()) do
+            if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("TextButton") then
+                local yPos = child.Position.Y.Offset + child.Size.Y.Offset
+                if yPos > maxY then maxY = yPos end
+            end
+        end
+        Content.CanvasSize = UDim2.new(0, 0, 0, maxY + 20)
+    end
+
+    function UpdateContent(tab)
+        if not Content then return end
+        for _, child in pairs(Content:GetChildren()) do child:Destroy() end
+        local y = 0
+        
+        if tab == "Principal" then
+            CreateLabel("⚡ Controles", y)
+            y = y + 28
+            CreateToggle("Interação Instantânea", y, "HoldDuration = 0 em todos os prompts", function(state)
+                Config.InstantAction = state
+                if state then
+                    for _, prompt in ipairs(Workspace:GetDescendants()) do
+                        if prompt:IsA("ProximityPrompt") then prompt.HoldDuration = 0 end
+                    end
+                end
+            end)
+            y = y + 50
+            CreateToggle("Auto Processamento Global", y, "Procura activa em todas as salas do mapa", function(state)
+                Config.AutoProcess = state
+            end)
+            y = y + 50
+            CreateToggle("Auto Room 6 (X-Ray)", y, "Sequência: X-Ray → 4 botões → Process → Badge → Collect", function(state)
+                Config.AutoRoom6 = state
+                if state then print("🔄 Auto Room 6 ativado!") end
+            end)
+            y = y + 50
+            CreateToggle("Auto Room 7", y, "Interações no InBed da Room 7", function(state)
+                Config.AutoRoom7 = state
+            end)
+            y = y + 50
+            CreateToggle("Auto Room 8", y, "Sleep Patient no InBed da Room 8", function(state)
+                Config.AutoRoom8 = state
+            end)
+            y = y + 50
+            CreateToggle("Auto Atendimento (Heal) v2.9.9", y, "Com validação, retry e busca automática", function(state)
+                Config.AutoHeal = state
+                if state then RefreshItemCache() end
+            end)
+            UpdateCanvas()
+            
+        elseif tab == "LocalPlayer" then
+            CreateLabel("👤 Jogador", y)
+            y = y + 28
+            CreateTextBox("Velocidade", y, "Digite 1-200", function(value)
+                local s = tonumber(value)
+                if s and s > 0 and s < 200 then Config.WalkSpeed = s end
+            end)
+            y = y + 50
+            CreateToggle("NoClip", y, "Atravessar paredes", function(state)
+                Config.NoClip = state
+                if not state then RestoreOriginalCollisions() end
+            end)
+            UpdateCanvas()
+            
+        elseif tab == "Sobre" then
+            CreateLabel("Detalhes do Script", y)
+            y = y + 28
+            CreateLabel("Animal Hospital Script", y, Color3.fromRGB(200, 30, 30))
+            y = y + 22
+            CreateLabel("Versão: v2.9.9", y, Color3.fromRGB(200, 200, 200))
+            y = y + 20
+            CreateLabel("Criador: Adrian", y, Color3.fromRGB(200, 200, 200))
+            y = y + 20
+            CreateLabel("Executor: Delta", y, Color3.fromRGB(200, 200, 200))
+            y = y + 30
+            CreateLabel("CORREÇÕES v2.9.9:", y, Color3.fromRGB(150, 150, 150))
+            y = y + 18
+            CreateLabel("• Auto Room 6: Sequência completa corrigida", y, Color3.fromRGB(130, 130, 130))
+            y = y + 16
+            CreateLabel("• Auto Room 6: Espera 4 botões mudarem de cor", y, Color3.fromRGB(130, 130, 130))
+            y = y + 16
+            CreateLabel("• Auto Room 6: Aguarda 1.5s antes de clicar", y, Color3.fromRGB(130, 130, 130))
+            y = y + 16
+            CreateLabel("• Auto Room 6: Procura Print Badge e Collect", y, Color3.fromRGB(130, 130, 130))
+            y = y + 16
+            CreateLabel("• Auto Heal: Retry e validação de itens", y, Color3.fromRGB(130, 130, 130))
+            y = y + 30
+            CreateButton("Resetar Velocidade", y, Color3.fromRGB(40, 10, 10), function()
+                Config.WalkSpeed = 16
+                local hum = GetHumanoid()
+                if hum then hum.WalkSpeed = 16 end
+            end)
+            y = y + 40
+            CreateButton("Desativar Tudo", y, Color3.fromRGB(80, 15, 15), function()
+                Config.InstantAction = false
+                Config.AutoProcess = false
+                Config.AutoRoom6 = false
+                Config.AutoRoom7 = false
+                Config.AutoRoom8 = false
+                Config.AutoHeal = false
+                Config.NoClip = false
+                RestoreOriginalCollisions()
+                Config.WalkSpeed = 16
+            end)
+            UpdateCanvas()
+        end
+    end
+
+    SidebarBtn("Principal", "🏠", 8)
+    SidebarBtn("LocalPlayer", "👤", 42)
+    SidebarBtn("Sobre", "📋", 76)
+    UpdateContent("Principal")
+
+    MinimizeBtn.MouseButton1Click:Connect(function()
+        _G.Minimized = not _G.Minimized
+        local tInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad)
+        if _G.Minimized then
+            TweenService:Create(MainFrame, tInfo, {Size = UDim2.new(0, 180, 0, 40)}):Play()
+            TweenService:Create(Shadow, tInfo, {Size = UDim2.new(0, 176, 0, 36), Position = UDim2.new(MainFrame.Position.X.Scale, MainFrame.Position.X.Offset - 2, MainFrame.Position.Y.Scale, MainFrame.Position.Y.Offset + 2)}):Play()
+            Container.Visible = false
+            HSep.Visible = false
+        else
+            TweenService:Create(MainFrame, tInfo, {Size = UDim2.new(0, 500, 0, 300)}):Play()
+            TweenService:Create(Shadow, tInfo, {Size = UDim2.new(0, 496, 0, 296), Position = UDim2.new(MainFrame.Position.X.Scale, MainFrame.Position.X.Offset - 2, MainFrame.Position.Y.Scale, MainFrame.Position.Y.Offset + 2)}):Play()
+            Container.Visible = true
+            HSep.Visible = true
+        end
+    end)
+
+    CloseBtn.MouseButton1Click:Connect(function()
+        RestoreOriginalCollisions()
+        if ScreenGui then ScreenGui:Destroy() end
+    end)
+
+    local dragging, dragStart, startPos
+    TopBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = MainFrame.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            if _G.Minimized then
+                Shadow.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X - 2, startPos.Y.Scale, startPos.Y.Offset + delta.Y + 2)
+            else
+                Shadow.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X - 5, startPos.Y.Scale, startPos.Y.Offset + delta.Y + 5)
+            end
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+pcall(BuildInterface)
+print("🚀 [Hospital Hub v2.9.9] Auto Room 6 corrigido com sequência completa!")
